@@ -1,3 +1,5 @@
+setuptools==69.5.1
+wheel
 about-time==4.2.1
 aiodns==4.0.4
 aiofiles==25.1.0
