@@ -300,7 +300,6 @@ Tata Consultancy Services, 240893, 45806, 58.40, 45.0"></textarea>
 
             const content = document.getElementById('tab-content');
             
-            // If multi-company table exists and we are on overview, show comparative multi-company table
             let multiCompanyHtml = '';
             if (currentWorkspace.multi_company_table && tabName === 'overview') {
                 const cols = currentWorkspace.multi_company_table.columns;
@@ -1072,7 +1071,6 @@ async def execute_pipeline(
     files: list[UploadFile] = File(None),
     pasted_data: str = Form(None)
 ):
-    # Handle pasted multiple/single company spreadsheet data
     if pasted_data:
         try:
             lines = [line.strip() for line in pasted_data.strip().split("\n") if line.strip()]
@@ -1106,7 +1104,6 @@ async def execute_pipeline(
         except Exception as e:
             pass
 
-    # Handle uploaded spreadsheet files (single or multiple)
     if files and len(files) > 0:
         try:
             all_scanned_rows = []
@@ -1122,11 +1119,9 @@ async def execute_pipeline(
                 else:
                     df = pd.read_excel(io.BytesIO(contents))
                 
-                # Extract summary info
                 comp_name = file.filename.replace('.xlsx', '').replace('.csv', '').replace('_', ' ').title()
                 primary_company = comp_name
                 
-                # Convert df to records for multi-company preview
                 records = df.head(5).to_dict(orient='records')
                 for r in records:
                     all_scanned_rows.append({"Company": comp_name, **{str(k): str(v) for k, v in r.items()}})
@@ -1150,7 +1145,6 @@ async def execute_pipeline(
         except Exception as e:
             pass
 
-    # Handle general prompt or dynamic company scan request (e.g. Reliance, TCS, Infosys)
     lower_prompt = prompt.lower()
     
     if "reliance" in lower_prompt:
