@@ -2,11 +2,111 @@ from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 import os
 import io
+import json
+import re
 import openpyxl
 import pandas as pd
 import numpy as np
+import httpx
 
 app = FastAPI()
+
+# FIX (dynamic-company research): reads the API key from the environment -- set
+# ANTHROPIC_API_KEY on your Render service's Environment tab. ANTHROPIC_MODEL lets you
+# override the model string without a code change if needed.
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5")
+
+_RESEARCH_SYSTEM_PROMPT = (
+    "You are a financial research assistant embedded in a dashboard backend. Research "
+    "the given company's most recent publicly available financial results using web "
+    "search, then respond with ONLY a single JSON object -- no markdown code fences, "
+    "no commentary before or after -- matching EXACTLY this shape:\n"
+    "{\n"
+    '  "latest": {"sales": <number>, "operating_profit": <number>, "net_profit": <number>, '
+    '"cfo": <number>, "current_price": <number>},\n'
+    '  "ratios": {"net_margin": <percent as number>, "roe": <percent as number>, '
+    '"roce": <percent as number>, "interest_coverage": <number>, "debt_equity": <number>, '
+    '"dso": <days>, "dpo": <days>, "dio": <days>, "ccc": <days>},\n'
+    '  "risk_flags": [{"severity": "positive"|"warning", "title": "<short title>", '
+    '"detail": "<one sentence>"}, ...],\n'
+    '  "about": "<2-4 sentence company overview, mention the currency/units used>",\n'
+    '  "financials": [{"item": "<line item>", "mar2022": "<prior period value as string>", '
+    '"mar2023": "<latest period value as string>"}, ...],\n'
+    '  "assets": [{"name": "...", "type": "...", "account": "Real Account"|"Personal Account"}, ...],\n'
+    '  "liabilities": [{"name": "...", "type": "...", "account": "Personal Account"}, ...],\n'
+    '  "incomes": [{"name": "...", "type": "...", "account": "Nominal Account"}, ...],\n'
+    '  "expenses": [{"name": "...", "type": "...", "account": "Nominal Account"}, ...],\n'
+    '  "conclusion": "<2-3 sentence conclusion>"\n'
+    "}\n"
+    "All numeric fields must be plain numbers (no currency symbols or commas). If a "
+    "figure genuinely cannot be found via search, give your best clearly-labelled "
+    "estimate and mention that limitation in 'about'. Never omit a field. Never wrap "
+    "the JSON in markdown fences."
+)
+
+
+async def research_company_via_llm(company_name: str) -> dict | None:
+    """Researches a company's real financials via the Anthropic API's web_search tool
+    and returns data in the exact shape the frontend's companyWorkspaces entries use.
+    Returns None (never fabricated data) if no API key is configured, or if the API
+    call, response parsing, or shape validation fails for any reason -- callers must
+    have an explicitly-labelled fallback for that case rather than treating None as
+    a company with no data."""
+    if not ANTHROPIC_API_KEY:
+        return None
+
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": ANTHROPIC_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": ANTHROPIC_MODEL,
+                    "max_tokens": 2000,
+                    "system": _RESEARCH_SYSTEM_PROMPT,
+                    "messages": [
+                        {"role": "user", "content": f"Research {company_name} and return the JSON object described in the system prompt."}
+                    ],
+                    "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+        text_blocks = [b.get("text", "") for b in data.get("content", []) if b.get("type") == "text"]
+        full_text = "\n".join(text_blocks).strip()
+
+        match = re.search(r"\{.*\}", full_text, re.DOTALL)
+        if not match:
+            return None
+        parsed = json.loads(match.group(0))
+
+        required_keys = {"latest", "ratios", "risk_flags", "about", "financials",
+                          "assets", "liabilities", "incomes", "expenses", "conclusion"}
+        if not required_keys.issubset(parsed.keys()):
+            return None
+
+        return {
+            "latest": parsed["latest"],
+            "ratios": parsed["ratios"],
+            "risk_flags": parsed["risk_flags"],
+            "fat1_data": {
+                "about": parsed["about"],
+                "financials": parsed["financials"],
+                "assets": parsed["assets"],
+                "liabilities": parsed["liabilities"],
+                "incomes": parsed["incomes"],
+                "expenses": parsed["expenses"],
+                "conclusion": parsed["conclusion"],
+            },
+        }
+    except Exception:
+        return None
 
 def generate_generic_fat1_data(company_name: str, sales: float, net_profit: float, roce: float, interest_coverage: float) -> dict:
     """Builds generic (non-hardcoded) FAT-1 assignment content for any scanned/pasted
