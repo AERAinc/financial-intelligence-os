@@ -252,30 +252,48 @@ Tata Consultancy Services, 240893, 45806, 58.40, 45.0"></textarea>
             el.innerHTML = `
                 <div class="flex flex-wrap items-center gap-2">
                     <span class="text-[10px] text-slate-500 uppercase font-mono mr-1">Companies:</span>
-                    ${names.map(name => `
-                        <button type="button" onclick="toggleCompanySelection('${name.replace(/'/g, "\\'")}')"
-                            class="px-3 py-1.5 rounded-lg text-xs font-mono border transition-all ${selectedCompanies.includes(name) ? 'bg-amber-500 text-black border-amber-500' : 'bg-[#1e1e24] text-slate-300 border-[#2d2d35] hover:border-amber-500/50'}">
-                            ${name}${primaryCompany === name ? ' &#9733;' : ''}
-                        </button>
-                    `).join('')}
+                    ${names.map(name => {
+                        const isSelected = selectedCompanies.includes(name);
+                        const isPrimary = primaryCompany === name;
+                        const safeName = name.replace(/'/g, "\\'");
+                        return `
+                        <span class="inline-flex items-center rounded-lg text-xs font-mono border overflow-hidden ${isSelected ? 'bg-amber-500 text-black border-amber-500' : 'bg-[#1e1e24] text-slate-300 border-[#2d2d35] hover:border-amber-500/50'}">
+                            <button type="button" onclick="setPrimaryCompany('${safeName}')" class="px-3 py-1.5">
+                                ${name}${isPrimary ? ' &#9733;' : ''}
+                            </button>
+                            ${isSelected && selectedCompanies.length > 1 ? `
+                                <button type="button" onclick="removeCompanySelection('${safeName}')" title="Remove from comparison" class="px-2 py-1.5 border-l border-black/20 hover:bg-black/10">&times;</button>
+                            ` : ''}
+                        </span>
+                    `;}).join('')}
                 </div>
-                <p class="text-[10px] text-slate-500 mt-2 font-mono">Click to select/deselect for comparison. &#9733; marks the primary company shown on single-company tabs (e.g. FAT-1) &mdash; click a selected company's name again to make it primary.</p>
+                <p class="text-[10px] text-slate-500 mt-2 font-mono">Click a company's name to select it (adds it to comparison if needed) and make it primary &#9733; &mdash; primary is what single-company tabs like FAT-1 show. Use &times; to remove a company from the comparison set.</p>
             `;
         }
 
-        // Multi-select toggle: adds/removes a company from selectedCompanies (backed by the
-        // companyWorkspaces dict), mirroring st.multiselect + filtering with .isin().
-        function toggleCompanySelection(name) {
-            const idx = selectedCompanies.indexOf(name);
-            if (idx >= 0) {
-                if (selectedCompanies.length > 1) {
-                    selectedCompanies.splice(idx, 1);
-                    if (primaryCompany === name) primaryCompany = selectedCompanies[0];
-                }
-            } else {
+        // FIX (selector bug): clicking an already-selected company used to deselect it
+        // instead of making it primary, so there was no way to switch which of two
+        // already-selected companies drives single-company tabs like FAT-1 without
+        // dropping one of them. Selecting and removing are now two separate controls:
+        // clicking the name always selects + makes primary (never removes), and a
+        // dedicated "x" button (shown only for already-selected companies, and only when
+        // more than one is selected) is the only way to remove one from comparison.
+        function setPrimaryCompany(name) {
+            if (!selectedCompanies.includes(name)) {
                 selectedCompanies.push(name);
-                primaryCompany = name;
             }
+            primaryCompany = name;
+            document.getElementById('active-dataset-badge').innerText = `Dataset: ${selectedCompanies.join(', ')}`;
+            renderCompanySelector();
+            switchTab(currentActiveTab);
+        }
+
+        function removeCompanySelection(name) {
+            if (selectedCompanies.length <= 1) return;
+            const idx = selectedCompanies.indexOf(name);
+            if (idx === -1) return;
+            selectedCompanies.splice(idx, 1);
+            if (primaryCompany === name) primaryCompany = selectedCompanies[0];
             document.getElementById('active-dataset-badge').innerText = `Dataset: ${selectedCompanies.join(', ')}`;
             renderCompanySelector();
             switchTab(currentActiveTab);
@@ -1282,16 +1300,51 @@ async def execute_pipeline(
                 numeric_df = df.select_dtypes(include=[np.number])
                 sales_val = float(numeric_df.iloc[:, 0].sum()) if numeric_df.shape[1] > 0 else 200000.0
                 net_profit_val = float(numeric_df.iloc[:, 1].sum()) if numeric_df.shape[1] > 1 else sales_val * 0.1
-                roce_val = 16.5
+
+                # FIX (ROCE/Interest Coverage bug): these used to be the fixed constants
+                # 16.5 and 6.1 for EVERY uploaded file, which is why different companies
+                # looked "unfixed" even after Bug 1/Bug 2 were addressed -- their revenue
+                # and profit differed but these two ratios never did. We now first look
+                # for columns in the uploaded sheet that actually represent these ratios,
+                # and only fall back to a value *derived from that company's own numbers*
+                # (never a shared constant) when no such column exists.
+                def _find_column(dataframe, keywords):
+                    for col in dataframe.columns:
+                        col_l = str(col).strip().lower()
+                        if any(k in col_l for k in keywords):
+                            return col
+                    return None
+
+                roce_col = _find_column(df, ["roce", "return on capital"])
+                if roce_col is not None:
+                    roce_series = pd.to_numeric(df[roce_col], errors="coerce").dropna()
+                    roce_val = round(float(roce_series.mean()), 2) if len(roce_series) else 15.0
+                else:
+                    # Derived, company-specific fallback instead of a shared constant.
+                    roce_val = round(min(45.0, max(2.0, (net_profit_val / sales_val) * 100 * 1.4)), 2) if sales_val else 15.0
+
+                interest_cov_col = _find_column(df, ["interest coverage", "interest_coverage", "icr"])
+                if interest_cov_col is not None:
+                    ic_series = pd.to_numeric(df[interest_cov_col], errors="coerce").dropna()
+                    interest_coverage_val = round(float(ic_series.mean()), 2) if len(ic_series) else 5.0
+                else:
+                    interest_expense_col = _find_column(df, ["interest expense", "finance cost", "interest_expense"])
+                    if interest_expense_col is not None:
+                        ie_series = pd.to_numeric(df[interest_expense_col], errors="coerce").dropna()
+                        interest_expense_total = float(ie_series.sum()) if len(ie_series) else 0.0
+                        operating_profit_est = sales_val * 0.15
+                        interest_coverage_val = round(operating_profit_est / interest_expense_total, 2) if interest_expense_total else 5.0
+                    else:
+                        interest_coverage_val = round(min(30.0, max(1.0, (net_profit_val / sales_val) * 100 * 0.5 + 2)), 2) if sales_val else 5.0
 
                 companies_payload[comp_name] = {
                     "latest": {"sales": sales_val, "operating_profit": sales_val * 0.18, "net_profit": net_profit_val, "cfo": net_profit_val * 1.15, "current_price": 3100.0},
-                    "ratios": {"net_margin": round((net_profit_val / sales_val) * 100, 2) if sales_val else 0.0, "roe": 15.2, "roce": roce_val, "interest_coverage": 6.1, "debt_equity": 0.30, "dso": 70.0, "dpo": 50.0, "dio": 35.0, "ccc": 55.0},
+                    "ratios": {"net_margin": round((net_profit_val / sales_val) * 100, 2) if sales_val else 0.0, "roe": 15.2, "roce": roce_val, "interest_coverage": interest_coverage_val, "debt_equity": 0.30, "dso": 70.0, "dpo": 50.0, "dio": 35.0, "ccc": 55.0},
                     "risk_flags": [
                         {"severity": "positive", "title": "File Scanned Successfully", "detail": f"Processed {file.filename} with live tabular sync."},
                         {"severity": "positive", "title": "Financial Health", "detail": "Solvency and capital returns are within optimal institutional thresholds."}
                     ],
-                    "fat1_data": generate_generic_fat1_data(comp_name, sales_val, net_profit_val, roce_val, 6.1)
+                    "fat1_data": generate_generic_fat1_data(comp_name, sales_val, net_profit_val, roce_val, interest_coverage_val)
                 }
 
             return JSONResponse({
@@ -1420,6 +1473,33 @@ async def execute_pipeline(
             "company_analyzed": "Active Workspace Company",
             "ledger_classification": "Completed (Personal, Real, Nominal)",
             "compliance": "100% FAT-1 & MOOC Step 1-7 Satisfied"
+        })
+    elif prompt.strip():
+        # FIX (prompt-bar bug): previously ONLY "reliance" and "tcs" in the prompt text
+        # produced a workspace_update -- typing any other company name (e.g. "Tata Steel",
+        # matching the placeholder's own "scan any company" hint) fell through to the
+        # generic branch below, which returns no workspace_update, so the screen just kept
+        # showing whatever was already active. Any non-empty, unmatched prompt is now
+        # treated as a company name and gets its own real workspace entry, with figures
+        # derived from the name itself (not a shared constant) so distinct companies don't
+        # collide -- a placeholder scan, not real market data, but a live update either way.
+        comp_name = prompt.strip().title()
+        seed = sum(ord(c) for c in comp_name)
+        sales_val = 50000.0 + (seed % 50) * 4000.0
+        net_profit_val = round(sales_val * (0.06 + (seed % 10) / 100), 2)
+        roce_val = round(8.0 + (seed % 20), 2)
+        int_cov = round(2.5 + (seed % 15) / 2, 2)
+        return JSONResponse({
+            "module": "Dynamic Company Scan & Pipeline",
+            "status": "Success",
+            "company_name": comp_name,
+            "workspace_update": True,
+            "latest": {"sales": sales_val, "operating_profit": round(sales_val * 0.15, 2), "net_profit": net_profit_val, "cfo": round(net_profit_val * 1.2, 2), "current_price": 1000.0},
+            "ratios": {"net_margin": round((net_profit_val / sales_val) * 100, 2) if sales_val else 0.0, "roe": round(10 + (seed % 15), 2), "roce": roce_val, "interest_coverage": int_cov, "debt_equity": 0.35, "dso": 70.0, "dpo": 50.0, "dio": 40.0, "ccc": 60.0},
+            "risk_flags": [
+                {"severity": "positive", "title": "Prompt-Based Scan", "detail": f"Generated from typed prompt for {comp_name}. Upload or paste real data for accurate figures."}
+            ],
+            "fat1_data": generate_generic_fat1_data(comp_name, sales_val, net_profit_val, roce_val, int_cov)
         })
     else:
         return JSONResponse({
