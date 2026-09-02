@@ -2,111 +2,11 @@ from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 import os
 import io
-import json
-import re
 import openpyxl
 import pandas as pd
 import numpy as np
-import httpx
 
 app = FastAPI()
-
-# FIX (dynamic-company research): reads the API key from the environment -- set
-# ANTHROPIC_API_KEY on your Render service's Environment tab. ANTHROPIC_MODEL lets you
-# override the model string without a code change if needed.
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5")
-
-_RESEARCH_SYSTEM_PROMPT = (
-    "You are a financial research assistant embedded in a dashboard backend. Research "
-    "the given company's most recent publicly available financial results using web "
-    "search, then respond with ONLY a single JSON object -- no markdown code fences, "
-    "no commentary before or after -- matching EXACTLY this shape:\n"
-    "{\n"
-    '  "latest": {"sales": <number>, "operating_profit": <number>, "net_profit": <number>, '
-    '"cfo": <number>, "current_price": <number>},\n'
-    '  "ratios": {"net_margin": <percent as number>, "roe": <percent as number>, '
-    '"roce": <percent as number>, "interest_coverage": <number>, "debt_equity": <number>, '
-    '"dso": <days>, "dpo": <days>, "dio": <days>, "ccc": <days>},\n'
-    '  "risk_flags": [{"severity": "positive"|"warning", "title": "<short title>", '
-    '"detail": "<one sentence>"}, ...],\n'
-    '  "about": "<2-4 sentence company overview, mention the currency/units used>",\n'
-    '  "financials": [{"item": "<line item>", "mar2022": "<prior period value as string>", '
-    '"mar2023": "<latest period value as string>"}, ...],\n'
-    '  "assets": [{"name": "...", "type": "...", "account": "Real Account"|"Personal Account"}, ...],\n'
-    '  "liabilities": [{"name": "...", "type": "...", "account": "Personal Account"}, ...],\n'
-    '  "incomes": [{"name": "...", "type": "...", "account": "Nominal Account"}, ...],\n'
-    '  "expenses": [{"name": "...", "type": "...", "account": "Nominal Account"}, ...],\n'
-    '  "conclusion": "<2-3 sentence conclusion>"\n'
-    "}\n"
-    "All numeric fields must be plain numbers (no currency symbols or commas). If a "
-    "figure genuinely cannot be found via search, give your best clearly-labelled "
-    "estimate and mention that limitation in 'about'. Never omit a field. Never wrap "
-    "the JSON in markdown fences."
-)
-
-
-async def research_company_via_llm(company_name: str) -> dict | None:
-    """Researches a company's real financials via the Anthropic API's web_search tool
-    and returns data in the exact shape the frontend's companyWorkspaces entries use.
-    Returns None (never fabricated data) if no API key is configured, or if the API
-    call, response parsing, or shape validation fails for any reason -- callers must
-    have an explicitly-labelled fallback for that case rather than treating None as
-    a company with no data."""
-    if not ANTHROPIC_API_KEY:
-        return None
-
-    try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            resp = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key": ANTHROPIC_API_KEY,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
-                },
-                json={
-                    "model": ANTHROPIC_MODEL,
-                    "max_tokens": 2000,
-                    "system": _RESEARCH_SYSTEM_PROMPT,
-                    "messages": [
-                        {"role": "user", "content": f"Research {company_name} and return the JSON object described in the system prompt."}
-                    ],
-                    "tools": [{"type": "web_search_20250305", "name": "web_search"}],
-                },
-            )
-            resp.raise_for_status()
-            data = resp.json()
-
-        text_blocks = [b.get("text", "") for b in data.get("content", []) if b.get("type") == "text"]
-        full_text = "\n".join(text_blocks).strip()
-
-        match = re.search(r"\{.*\}", full_text, re.DOTALL)
-        if not match:
-            return None
-        parsed = json.loads(match.group(0))
-
-        required_keys = {"latest", "ratios", "risk_flags", "about", "financials",
-                          "assets", "liabilities", "incomes", "expenses", "conclusion"}
-        if not required_keys.issubset(parsed.keys()):
-            return None
-
-        return {
-            "latest": parsed["latest"],
-            "ratios": parsed["ratios"],
-            "risk_flags": parsed["risk_flags"],
-            "fat1_data": {
-                "about": parsed["about"],
-                "financials": parsed["financials"],
-                "assets": parsed["assets"],
-                "liabilities": parsed["liabilities"],
-                "incomes": parsed["incomes"],
-                "expenses": parsed["expenses"],
-                "conclusion": parsed["conclusion"],
-            },
-        }
-    except Exception:
-        return None
 
 def generate_generic_fat1_data(company_name: str, sales: float, net_profit: float, roce: float, interest_coverage: float) -> dict:
     """Builds generic (non-hardcoded) FAT-1 assignment content for any scanned/pasted
@@ -133,6 +33,16 @@ def generate_generic_fat1_data(company_name: str, sales: float, net_profit: floa
         "conclusion": f"{company_name} shows ROCE of {roce}% and interest coverage of {interest_coverage}x based on the data provided. This is auto-generated from the scanned figures, not a canned template from another company.",
     }
 
+def generate_synthetic_trend(sales: float, net_profit: float) -> list:
+    """Builds a simple 3-period trend (prior, current, projected) from a single scanned
+    data point so the revenue/profit chart has something to plot for dynamically scanned
+    companies, instead of crashing on a missing trend array."""
+    return [
+        {"date": "Prior Period", "sales": round(sales * 0.87, 2), "net_profit": round(net_profit * 0.85, 2)},
+        {"date": "Latest Period", "sales": round(sales, 2), "net_profit": round(net_profit, 2)},
+        {"date": "Projected", "sales": round(sales * 1.12, 2), "net_profit": round(net_profit * 1.15, 2)},
+    ]
+
 
 HTML_CONTENT = """<!DOCTYPE html>
 <html lang="en">
@@ -157,7 +67,7 @@ HTML_CONTENT = """<!DOCTYPE html>
                 </div>
             </div>
             <div class="flex items-center space-x-4 text-xs font-mono">
-                <span id="active-dataset-badge" class="px-3 py-1 rounded bg-[#1e1e24] text-slate-300 border border-[#2d2d35]">Dataset: None selected</span>
+                <span id="active-dataset-badge" class="px-3 py-1 rounded bg-[#1e1e24] text-slate-300 border border-[#2d2d35]">Dataset: Larsen &amp; Toubro.xlsx</span>
                 <span class="inline-flex items-center px-2.5 py-1 rounded bg-emerald-950/40 text-emerald-400 border border-emerald-800/50">
                     <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse mr-1.5"></span> Live Connection
                 </span>
@@ -176,7 +86,7 @@ HTML_CONTENT = """<!DOCTYPE html>
         <div class="bg-[#16161a] border border-amber-500/40 rounded-xl p-5 shadow-xl">
             <h3 class="text-xs font-bold uppercase tracking-wider text-amber-400 font-mono mb-2">Layman Summary Overview</h3>
             <p id="layman-summary-text" class="text-xs text-slate-300 leading-relaxed font-sans">
-                No company loaded yet. Type any company name into the prompt bar and click "Run Pipeline / Scan", or upload / paste spreadsheet data, to research and load a company into this workspace.
+                Larsen &amp; Toubro is a massive global engineering company. In simple terms, it makes a lot of money (over ₹1.83 lakh crore in revenue), keeps its debts well-managed with a strong safety buffer (Interest Coverage 4.85x), and runs efficiently with solid returns on capital (ROCE 14.20%). Its everyday transactions fit cleanly into standard accounting categories like real assets, personal accounts, and operational costs.
             </p>
         </div>
 
@@ -256,26 +166,76 @@ Tata Consultancy Services, 240893, 45806, 58.40, 45.0"></textarea>
         // Every render function reads through activeWorkspace()/getWorkspace(name) instead of
         // touching a single shared object, so switching the active company can never leak
         // another company's summary into the display.
-        // FIX (dynamic-company request): no company is preloaded/hardcoded anymore.
-        // The workspace starts genuinely empty and is populated only by what the user
-        // scans, uploads, or pastes -- never a fixed default like "Larsen & Toubro".
-        const companyWorkspaces = {};
+        const companyWorkspaces = {
+            "Larsen & Toubro": {
+            company_name: "Larsen & Toubro",
+            latest: { sales: 183142.0, operating_profit: 22150.0, net_profit: 13059.0, cfo: 16500.0, current_price: 3650.0 },
+            ratios: { net_margin: 7.13, roe: 11.66, roce: 14.20, interest_coverage: 4.85, debt_equity: 0.43, dso: 84.5, dpo: 62.1, dio: 45.3, ccc: 67.7 },
+            risk_flags: [
+                { severity: "positive", title: "Revenue Expansion", detail: "Annual top-line expanded by 14.2% YoY supported by core engineering orders." },
+                { severity: "warning", title: "Working Capital", detail: "Receivables collection period remains elevated at ~84 days." },
+                { severity: "positive", title: "Solvency Buffer", detail: "Interest coverage of 4.85x exceeds minimum thresholds." }
+            ],
+            trend: [
+                { date: "Mar 2022", sales: 135979, net_profit: 8572 },
+                { date: "Mar 2023", sales: 183142, net_profit: 13059 },
+                { date: "Mar 2024 (Est)", sales: 215000, net_profit: 15800 }
+            ],
+            fat1_data: {
+                about: "Larsen & Toubro Limited (L&T) is an Indian multinational conglomerate, engaged in engineering, procurement and construction (EPC) projects, hi-tech manufacturing and services. Operating in over 50 countries worldwide, L&T is one of the world's largest construction companies, renowned for executing mega infrastructure, defense, power, and hydrocarbon projects. Founded in 1938 by Danish engineers Henning Holck-Larsen and Søren Kristian Toubro in Bombay, the company has grown into a titan of Indian industry, driving core technological innovation and capital formation.",
+                financials: [
+                    { item: "Revenue from Operations", mar2022: "₹1,35,979 Cr", mar2023: "₹1,83,142 Cr" },
+                    { item: "Operating Profit (EBITDA)", mar2022: "₹16,420 Cr", mar2023: "₹22,150 Cr" },
+                    { item: "Net Profit After Tax (PAT)", mar2022: "₹8,572 Cr", mar2023: "₹13,059 Cr" },
+                    { item: "Total Assets", mar2022: "₹2,75,410 Cr", mar2023: "₹3,14,890 Cr" },
+                    { item: "Total Liabilities", mar2022: "₹1,95,120 Cr", mar2023: "₹2,18,450 Cr" }
+                ],
+                assets: [
+                    { name: "Property, Plant & Equipment", type: "Non-Current Asset (Tangible)", account: "Real Account" },
+                    { name: "Capital Work-in-Progress", type: "Non-Current Asset (Tangible)", account: "Real Account" },
+                    { name: "Trade Receivables", type: "Current Asset", account: "Personal Account" },
+                    { name: "Cash and Cash Equivalents", type: "Current Asset (Liquid)", account: "Real Account" },
+                    { name: "Inventories & Contract Work", type: "Current Asset", account: "Real Account" },
+                    { name: "Intangible Assets (Software/IP)", type: "Non-Current Asset (Intangible)", account: "Real Account" }
+                ],
+                liabilities: [
+                    { name: "Equity Share Capital", type: "Shareholders' Funds", account: "Personal Account" },
+                    { name: "Reserves and Surplus", type: "Shareholders' Funds", account: "Personal Account" },
+                    { name: "Long-term Borrowings (Bonds)", type: "Non-Current Liability", account: "Personal Account" },
+                    { name: "Short-term Working Capital Loans", type: "Current Liability", account: "Personal Account" },
+                    { name: "Trade Payables & Creditors", type: "Current Liability", account: "Personal Account" },
+                    { name: "Provision for Employee Benefits", type: "Current/Non-Current Provision", account: "Personal Account" }
+                ],
+                incomes: [
+                    { name: "Revenue from Engineering Contracts", type: "Operating Direct Income", account: "Nominal Account" },
+                    { name: "Manufacturing & Sales Revenue", type: "Operating Direct Income", account: "Nominal Account" },
+                    { name: "Interest Income on Deposits", type: "Non-Operating Indirect Income", account: "Nominal Account" },
+                    { name: "Dividend from Subsidiaries", type: "Investment Income", account: "Nominal Account" }
+                ],
+                expenses: [
+                    { name: "Cost of Raw Materials & Construction", type: "Direct Manufacturing Expense", account: "Nominal Account" },
+                    { name: "Employee Benefit Expenses (Salaries)", type: "Indirect Operating Expense", account: "Nominal Account" },
+                    { name: "Finance Costs (Interest on Debt)", type: "Financial Expense", account: "Nominal Account" },
+                    { name: "Depreciation & Amortization", type: "Non-Cash Operating Expense", account: "Nominal Account" }
+                ],
+                conclusion: "The financial statement analysis of Larsen & Toubro showcases robust top-line growth (14.2% YoY) alongside high capital efficiency (ROCE: 14.20%, ROE: 11.66%). The rigorous classification of ledger accounts under Personal, Real, and Nominal categories confirms compliance with double-entry bookkeeping principles. L&T maintains a solid solvency buffer (Interest Coverage 4.85x) and a healthy asset backing, making it a prime subject for both corporate institutional investment and academic financial accounting research."
+            },
+            multi_company_table: null
+            }
+        };
 
-        // FIX (Bug 2, preserved): companies live in a dictionary keyed by name (the JS
-        // equivalent of a `st.session_state` dict), with a multi-select list of which
-        // are in the current comparison set and which one is "primary" for single-company
-        // tabs (e.g. FAT-1). Both start empty -- nothing is loaded until the user acts.
-        let selectedCompanies = [];
-        let primaryCompany = null;
+        // FIX (Bug 2): instead of a single "currently loaded" company, we track which
+        // company names are selected (multi-select, like st.multiselect + df[df.Company.isin(selected)])
+        // and which one is "primary" for tabs that can only show one company at a time (e.g. FAT-1).
+        let selectedCompanies = ["Larsen & Toubro"];
+        let primaryCompany = "Larsen & Toubro";
         let currentActiveTab = 'overview';
 
-        // Returns the workspace object for the primary company, or null if nothing has
-        // been scanned/uploaded/pasted yet. Every caller must handle the null case --
-        // see the empty-state guard at the top of switchTab().
+        // Returns the workspace object for the primary company. All single-company tabs
+        // (overview cards, FAT-1, multiples, etc.) read through this instead of a shared mutable object.
         function activeWorkspace() {
-            return primaryCompany ? companyWorkspaces[primaryCompany] : null;
+            return companyWorkspaces[primaryCompany];
         }
-
 
         // Equivalent of `pd.concat([df[df.Company == c] for c in selected_companies])`:
         // builds one comparison table by concatenating each selected company's row from the dict.
@@ -295,132 +255,37 @@ Tata Consultancy Services, 240893, 45806, 58.40, 45.0"></textarea>
             return { columns: ["Company", "Sales", "Net_Profit", "ROCE", "Interest_Coverage"], rows };
         }
 
-        // FIX (static-tab request): Multiples, Actuarial, Econometrics, Accounting/CVP,
-        // Valuation/DCF, IB/LBO, Portfolio/BSM, and Quantum used to show the exact same
-        // hardcoded figures for every company, with no connection to activeWorkspace() at
-        // all. This derives every one of those figures from the company's OWN fundamentals
-        // (latest + ratios) plus a name-seeded variation, so two different companies never
-        // show identical numbers, and the numbers move sensibly with a company's actual
-        // ROCE/margins/leverage. These are model-derived estimates for illustration --
-        // NOT live market data (we have no market cap, share count, or WACC inputs from
-        // any data source) -- clearly labelled as "Est." in the UI.
-        function deriveAnalytics(ws) {
-            const seed = ws.company_name.split('').reduce((a, c) => a + c.charCodeAt(0), 0);
-            const roce = ws.ratios.roce || 10;
-            const roe = ws.ratios.roe || 10;
-            const netMargin = ws.ratios.net_margin || 8;
-            const interestCov = ws.ratios.interest_coverage || 5;
-            const debtEquity = ws.ratios.debt_equity || 0.4;
-            const sales = ws.latest.sales || 1;
-            const opProfit = ws.latest.operating_profit || sales * 0.15;
-            const price = ws.latest.current_price || 1000;
-            const cfo = ws.latest.cfo || opProfit * 0.8;
-
-            const evEbitda = Math.max(4, Math.min(35, 12 + (30 - roce) / 4 + (seed % 7) - 3));
-            const pe = Math.max(5, evEbitda * (1 + roe / 100));
-            const pb = Math.max(0.5, pe * (roe / 100) * 1.1);
-            const impliedEv = opProfit * evEbitda;
-            const impliedSharePrice = price * (1 + (roce - 12) / 100);
-            const fcfe = cfo * (1 - debtEquity * 0.3);
-            const wacc = Math.max(6, Math.min(18, 9 + debtEquity * 3 - (roce - 12) / 20));
-
-            let creditRating = "BB (Speculative)";
-            if (roce > 35) creditRating = "AAA (Superior)";
-            else if (roce > 22) creditRating = "AA (Investment Grade)";
-            else if (roce > 14) creditRating = "A (Investment Grade)";
-            else if (roce > 8) creditRating = "BBB (Investment Grade)";
-
-            return {
-                evEbitda: evEbitda.toFixed(1),
-                peerAvgEvEbitda: (evEbitda * 1.08).toFixed(1),
-                pe: pe.toFixed(1),
-                sectorPe: (pe * 1.15).toFixed(1),
-                pb: pb.toFixed(2),
-                bookValue: (price / Math.max(pb, 0.1)).toFixed(0),
-                earningsYield: (100 / Math.max(pe, 1)).toFixed(2),
-                fcff: cfo.toFixed(0),
-                fcfe: fcfe.toFixed(0),
-                impliedSharePrice: impliedSharePrice.toFixed(0),
-                upsidePct: (((impliedSharePrice - price) / price) * 100).toFixed(1),
-                impliedEv: impliedEv.toFixed(0),
-                wacc: wacc.toFixed(2),
-                adjustmentCoefficient: (0.02 + interestCov / 250).toFixed(4),
-                ruinProbability: Math.max(0.01, (100 * Math.exp(-(0.02 + interestCov / 250) * 10))).toFixed(2),
-                solvencyMargin: (1 + interestCov / 8).toFixed(2),
-                capitalElasticity: (0.30 + (seed % 25) / 100).toFixed(3),
-                laborElasticity: (0.70 - (seed % 25) / 100).toFixed(3),
-                rSquared: (0.85 + (seed % 12) / 100).toFixed(3),
-                contributionMargin: Math.min(70, netMargin + 22 + (seed % 12)).toFixed(1),
-                operatingLeverage: (1.3 + (seed % 20) / 10).toFixed(2),
-                breakevenRevenue: (sales * (1 - Math.min(netMargin, 40) / 100 * 0.55)).toFixed(0),
-                sponsorIrr: Math.min(45, 12 + roce / 2.2).toFixed(1),
-                moic: (1.8 + roce / 35).toFixed(2),
-                initialLeverage: (2 + debtEquity * 3).toFixed(1),
-                creditRating: creditRating,
-                bsmCallValue: (price * (0.04 + (seed % 10) / 200)).toFixed(2),
-                sharpeRatio: (0.8 + roce / 45).toFixed(2),
-                var95: (-(1.5 + (seed % 12) / 5)).toFixed(2),
-                optionDelta: (0.42 + roce / 220).toFixed(3),
-                groundStateEnergy: (-(8 + (seed % 15))).toFixed(3),
-                entanglementFidelity: (96 + (seed % 4) + (seed % 100) / 100).toFixed(2),
-                circuitDepth: 4 + (seed % 8),
-                quantumSharpeBound: (1.4 + roce / 60).toFixed(2)
-            };
-        }
-
         function renderCompanySelector() {
             const el = document.getElementById('company-selector');
             if (!el) return;
             const names = Object.keys(companyWorkspaces);
-            if (names.length === 0) {
-                el.innerHTML = `<p class="text-[11px] text-slate-500 font-mono">No companies loaded yet. Type a company name in the prompt bar, or upload / paste data, to add one.</p>`;
-                return;
-            }
             el.innerHTML = `
                 <div class="flex flex-wrap items-center gap-2">
                     <span class="text-[10px] text-slate-500 uppercase font-mono mr-1">Companies:</span>
-                    ${names.map(name => {
-                        const isSelected = selectedCompanies.includes(name);
-                        const isPrimary = primaryCompany === name;
-                        const safeName = name.replace(/'/g, "\\'");
-                        return `
-                        <span class="inline-flex items-center rounded-lg text-xs font-mono border overflow-hidden ${isSelected ? 'bg-amber-500 text-black border-amber-500' : 'bg-[#1e1e24] text-slate-300 border-[#2d2d35] hover:border-amber-500/50'}">
-                            <button type="button" onclick="setPrimaryCompany('${safeName}')" class="px-3 py-1.5">
-                                ${name}${isPrimary ? ' &#9733;' : ''}
-                            </button>
-                            ${isSelected && selectedCompanies.length > 1 ? `
-                                <button type="button" onclick="removeCompanySelection('${safeName}')" title="Remove from comparison" class="px-2 py-1.5 border-l border-black/20 hover:bg-black/10">&times;</button>
-                            ` : ''}
-                        </span>
-                    `;}).join('')}
+                    ${names.map(name => `
+                        <button type="button" onclick="toggleCompanySelection('${name.replace(/'/g, "\\'")}')"
+                            class="px-3 py-1.5 rounded-lg text-xs font-mono border transition-all ${selectedCompanies.includes(name) ? 'bg-amber-500 text-black border-amber-500' : 'bg-[#1e1e24] text-slate-300 border-[#2d2d35] hover:border-amber-500/50'}">
+                            ${name}${primaryCompany === name ? ' &#9733;' : ''}
+                        </button>
+                    `).join('')}
                 </div>
-                <p class="text-[10px] text-slate-500 mt-2 font-mono">Click a company's name to select it (adds it to comparison if needed) and make it primary &#9733; &mdash; primary is what single-company tabs like FAT-1 show. Use &times; to remove a company from the comparison set.</p>
+                <p class="text-[10px] text-slate-500 mt-2 font-mono">Click to select/deselect for comparison. &#9733; marks the primary company shown on single-company tabs (e.g. FAT-1) &mdash; click a selected company's name again to make it primary.</p>
             `;
         }
 
-        // FIX (selector bug): clicking an already-selected company used to deselect it
-        // instead of making it primary, so there was no way to switch which of two
-        // already-selected companies drives single-company tabs like FAT-1 without
-        // dropping one of them. Selecting and removing are now two separate controls:
-        // clicking the name always selects + makes primary (never removes), and a
-        // dedicated "x" button (shown only for already-selected companies, and only when
-        // more than one is selected) is the only way to remove one from comparison.
-        function setPrimaryCompany(name) {
-            if (!selectedCompanies.includes(name)) {
-                selectedCompanies.push(name);
-            }
-            primaryCompany = name;
-            document.getElementById('active-dataset-badge').innerText = `Dataset: ${selectedCompanies.join(', ')}`;
-            renderCompanySelector();
-            switchTab(currentActiveTab);
-        }
-
-        function removeCompanySelection(name) {
-            if (selectedCompanies.length <= 1) return;
+        // Multi-select toggle: adds/removes a company from selectedCompanies (backed by the
+        // companyWorkspaces dict), mirroring st.multiselect + filtering with .isin().
+        function toggleCompanySelection(name) {
             const idx = selectedCompanies.indexOf(name);
-            if (idx === -1) return;
-            selectedCompanies.splice(idx, 1);
-            if (primaryCompany === name) primaryCompany = selectedCompanies[0];
+            if (idx >= 0) {
+                if (selectedCompanies.length > 1) {
+                    selectedCompanies.splice(idx, 1);
+                    if (primaryCompany === name) primaryCompany = selectedCompanies[0];
+                }
+            } else {
+                selectedCompanies.push(name);
+                primaryCompany = name;
+            }
             document.getElementById('active-dataset-badge').innerText = `Dataset: ${selectedCompanies.join(', ')}`;
             renderCompanySelector();
             switchTab(currentActiveTab);
@@ -569,25 +434,7 @@ Tata Consultancy Services, 240893, 45806, 58.40, 45.0"></textarea>
             });
 
             const content = document.getElementById('tab-content');
-
-            // FIX (dynamic-company request): with no hardcoded default company, the
-            // workspace can genuinely be empty (nothing scanned/uploaded/pasted yet).
-            // Every tab renders this guard instead of any tab-specific content until a
-            // real company is loaded, rather than crashing on a null activeWorkspace().
-            if (!activeWorkspace()) {
-                content.innerHTML = `
-                    <div class="col-span-12 bg-[#16161a] border border-dashed border-[#3f3f4e] rounded-xl p-10 shadow-xl text-center">
-                        <h3 class="text-sm font-bold text-amber-400 uppercase tracking-wider font-mono mb-2">No Company Selected</h3>
-                        <p class="text-xs text-slate-400 max-w-md mx-auto leading-relaxed">
-                            Nothing has been researched yet. Type any company name into the prompt bar above and click
-                            <span class="text-amber-400">Run Pipeline / Scan</span>, or upload / paste spreadsheet data,
-                            to load a company into this workspace &mdash; any company, not just a fixed demo list.
-                        </p>
-                    </div>
-                `;
-                return;
-            }
-
+            
             let multiCompanyHtml = '';
             // FIX (Bug 2): when more than one company is selected, build the comparison table by
             // concatenating each selected company's row out of companyWorkspaces (dict + .isin()-style
@@ -677,7 +524,6 @@ Tata Consultancy Services, 240893, 45806, 58.40, 45.0"></textarea>
                 `;
                 renderChart();
             } else if (tabName === 'multiples') {
-                const d = deriveAnalytics(activeWorkspace());
                 content.innerHTML = `
                     <div class="col-span-12 bg-[#16161a] border border-[#2d2d35] rounded-xl p-6 shadow-xl space-y-6">
                         <div class="flex items-center justify-between border-b border-[#2d2d35] pb-4">
@@ -695,17 +541,17 @@ Tata Consultancy Services, 240893, 45806, 58.40, 45.0"></textarea>
                                 <div class="p-5 bg-[#121216] rounded-xl border border-[#2d2d35] flex flex-col justify-between space-y-4 hover:border-amber-500/50 transition-colors">
                                     <div>
                                         <div class="flex items-center justify-between mb-2">
-                                            <span class="text-[11px] font-bold text-amber-400 uppercase font-mono tracking-wider">EV / EBITDA Multiple (Est.)</span>
-                                            <span class="text-[10px] bg-amber-950/60 text-amber-300 px-2 py-0.5 rounded border border-amber-800/40 font-mono">Peer Avg: ${d.peerAvgEvEbitda}x</span>
+                                            <span class="text-[11px] font-bold text-amber-400 uppercase font-mono tracking-wider">EV / EBITDA Multiple</span>
+                                            <span class="text-[10px] bg-amber-950/60 text-amber-300 px-2 py-0.5 rounded border border-amber-800/40 font-mono">Peer Avg: 19.2x</span>
                                         </div>
-                                        <div class="text-3xl font-black text-white font-mono">${d.evEbitda}x</div>
+                                        <div class="text-3xl font-black text-white font-mono">18.5x</div>
                                         <div class="mt-3 text-xs text-slate-300 leading-relaxed">
                                             <strong class="text-white block mb-1">Detailed Explanation:</strong>
-                                            Model-estimated Enterprise Value divided by EBITDA for ${activeWorkspace().company_name}, derived from its own ROCE and operating profit (no live market cap feed is connected).
+                                            Enterprise Value divided by EBITDA for ${activeWorkspace().company_name}. Evaluates total company cost relative to core operating cash generation.
                                         </div>
                                     </div>
                                     <div class="pt-3 border-t border-[#2d2d35] text-[11px] text-emerald-400 font-mono flex items-center justify-between">
-                                        <span>Status: ${parseFloat(d.evEbitda) < parseFloat(d.peerAvgEvEbitda) ? 'Slightly Undervalued' : 'Slightly Rich'}</span>
+                                        <span>Status: Slightly Undervalued</span>
                                         <span>DAX: [EV] / [EBITDA]</span>
                                     </div>
                                 </div>
@@ -713,17 +559,17 @@ Tata Consultancy Services, 240893, 45806, 58.40, 45.0"></textarea>
                                 <div class="p-5 bg-[#121216] rounded-xl border border-[#2d2d35] flex flex-col justify-between space-y-4 hover:border-amber-500/50 transition-colors">
                                     <div>
                                         <div class="flex items-center justify-between mb-2">
-                                            <span class="text-[11px] font-bold text-emerald-400 uppercase font-mono tracking-wider">Price-to-Earnings (P/E, Est.)</span>
-                                            <span class="text-[10px] bg-emerald-950/60 text-emerald-300 px-2 py-0.5 rounded border border-emerald-800/40 font-mono">Sector: ${d.sectorPe}x</span>
+                                            <span class="text-[11px] font-bold text-emerald-400 uppercase font-mono tracking-wider">Price-to-Earnings (P/E)</span>
+                                            <span class="text-[10px] bg-emerald-950/60 text-emerald-300 px-2 py-0.5 rounded border border-emerald-800/40 font-mono">Sector: 31.4x</span>
                                         </div>
-                                        <div class="text-3xl font-black text-emerald-400 font-mono">${d.pe}x</div>
+                                        <div class="text-3xl font-black text-emerald-400 font-mono">27.9x</div>
                                         <div class="mt-3 text-xs text-slate-300 leading-relaxed">
                                             <strong class="text-white block mb-1">Detailed Explanation:</strong>
-                                            Estimated from ${activeWorkspace().company_name}'s ROE and margin profile. Reflects modeled market sentiment, not a live quoted P/E.
+                                            Current share price relative to annual earnings per share (EPS). Reflects market sentiment and investor willingness to pay per rupee of net profit.
                                         </div>
                                     </div>
                                     <div class="pt-3 border-t border-[#2d2d35] text-[11px] text-slate-400 font-mono flex items-center justify-between">
-                                        <span>Earnings Yield: ${d.earningsYield}%</span>
+                                        <span>Earnings Yield: 3.58%</span>
                                         <span>DAX: [Price] / [EPS]</span>
                                     </div>
                                 </div>
@@ -731,17 +577,17 @@ Tata Consultancy Services, 240893, 45806, 58.40, 45.0"></textarea>
                                 <div class="p-5 bg-[#121216] rounded-xl border border-[#2d2d35] flex flex-col justify-between space-y-4 hover:border-amber-500/50 transition-colors">
                                     <div>
                                         <div class="flex items-center justify-between mb-2">
-                                            <span class="text-[11px] font-bold text-purple-400 uppercase font-mono tracking-wider">Price-to-Book (P/B, Est.)</span>
-                                            <span class="text-[10px] bg-purple-950/60 text-purple-300 px-2 py-0.5 rounded border border-purple-800/40 font-mono">Book Val: ₹${d.bookValue}</span>
+                                            <span class="text-[11px] font-bold text-purple-400 uppercase font-mono tracking-wider">Price-to-Book (P/B)</span>
+                                            <span class="text-[10px] bg-purple-950/60 text-purple-300 px-2 py-0.5 rounded border border-purple-800/40 font-mono">Book Val: ₹1,308</span>
                                         </div>
-                                        <div class="text-3xl font-black text-white font-mono">${d.pb}x</div>
+                                        <div class="text-3xl font-black text-white font-mono">2.79x</div>
                                         <div class="mt-3 text-xs text-slate-300 leading-relaxed">
                                             <strong class="text-white block mb-1">Detailed Explanation:</strong>
-                                            Compares an estimated market value against book value implied by ${activeWorkspace().company_name}'s own ROE. Useful for asset-heavy businesses.
+                                            Compares market capitalization against total net asset value on the balance sheet. Essential for asset-heavy conglomerates.
                                         </div>
                                     </div>
                                     <div class="pt-3 border-t border-[#2d2d35] text-[11px] text-emerald-400 font-mono flex items-center justify-between">
-                                        <span>ROE: ${activeWorkspace().ratios.roe}%</span>
+                                        <span>ROE Multiplier: Strong</span>
                                         <span>DAX: [Cap] / [Equity]</span>
                                     </div>
                                 </div>
@@ -756,16 +602,16 @@ Tata Consultancy Services, 240893, 45806, 58.40, 45.0"></textarea>
                                     <div>
                                         <div class="flex items-center justify-between mb-2">
                                             <span class="text-[11px] font-bold text-blue-400 uppercase font-mono tracking-wider">FCFF (Free Cash Flow to Firm)</span>
-                                            <span class="text-[10px] bg-blue-950/60 text-blue-300 px-2 py-0.5 rounded border border-blue-800/40 font-mono">CFO: ₹${Number(d.fcff).toLocaleString()} Cr</span>
+                                            <span class="text-[10px] bg-blue-950/60 text-blue-300 px-2 py-0.5 rounded border border-blue-800/40 font-mono">CFO: ₹${activeWorkspace().latest.cfo} Cr</span>
                                         </div>
-                                        <div class="text-3xl font-black text-white font-mono">₹${Number(d.fcff).toLocaleString()} Cr</div>
+                                        <div class="text-3xl font-black text-white font-mono">₹${activeWorkspace().latest.cfo} Cr</div>
                                         <div class="mt-3 text-xs text-slate-300 leading-relaxed">
                                             <strong class="text-white block mb-1">Detailed Explanation:</strong>
-                                            Operating cash flow for ${activeWorkspace().company_name}. Represents cash available to all capital providers before financing effects.
+                                            Operating cash flow minus capital expenditures. Represents pure unencumbered cash available to all capital providers.
                                         </div>
                                     </div>
                                     <div class="pt-3 border-t border-[#2d2d35] text-[11px] text-emerald-400 font-mono flex items-center justify-between">
-                                        <span>Net Margin: ${activeWorkspace().ratios.net_margin}%</span>
+                                        <span>Conversion: High</span>
                                         <span>DAX: [CFO] - [CapEx]</span>
                                     </div>
                                 </div>
@@ -773,17 +619,17 @@ Tata Consultancy Services, 240893, 45806, 58.40, 45.0"></textarea>
                                 <div class="p-5 bg-[#121216] rounded-xl border border-[#2d2d35] flex flex-col justify-between space-y-4 hover:border-blue-500/50 transition-colors">
                                     <div>
                                         <div class="flex items-center justify-between mb-2">
-                                            <span class="text-[11px] font-bold text-amber-400 uppercase font-mono tracking-wider">FCFE (Free Cash Flow to Equity, Est.)</span>
-                                            <span class="text-[10px] bg-amber-950/60 text-amber-300 px-2 py-0.5 rounded border border-amber-800/40 font-mono">Debt/Equity: ${activeWorkspace().ratios.debt_equity}</span>
+                                            <span class="text-[11px] font-bold text-amber-400 uppercase font-mono tracking-wider">FCFE (Free Cash Flow to Equity)</span>
+                                            <span class="text-[10px] bg-amber-950/60 text-amber-300 px-2 py-0.5 rounded border border-amber-800/40 font-mono">Net Debt Change</span>
                                         </div>
-                                        <div class="text-3xl font-black text-white font-mono">₹${Number(d.fcfe).toLocaleString()} Cr</div>
+                                        <div class="text-3xl font-black text-white font-mono">₹13,200 Cr</div>
                                         <div class="mt-3 text-xs text-slate-300 leading-relaxed">
                                             <strong class="text-white block mb-1">Detailed Explanation:</strong>
-                                            Cash estimated as distributable to equity holders after adjusting FCFF for ${activeWorkspace().company_name}'s own leverage.
+                                            Cash remaining after all operating expenses, interest payments, and reinvestment in fixed assets. Ultimate cash distributable to equity holders.
                                         </div>
                                     </div>
                                     <div class="pt-3 border-t border-[#2d2d35] text-[11px] text-emerald-400 font-mono flex items-center justify-between">
-                                        <span>WACC (Est.): ${d.wacc}%</span>
+                                        <span>Dividend Capacity: High</span>
                                         <span>DAX: [FCFF] - Interest + Borrowings</span>
                                     </div>
                                 </div>
@@ -791,17 +637,17 @@ Tata Consultancy Services, 240893, 45806, 58.40, 45.0"></textarea>
                                 <div class="p-5 bg-[#121216] rounded-xl border border-[#2d2d35] flex flex-col justify-between space-y-4 hover:border-blue-500/50 transition-colors">
                                     <div>
                                         <div class="flex items-center justify-between mb-2">
-                                            <span class="text-[11px] font-bold text-emerald-400 uppercase font-mono tracking-wider">Blended Target Valuation (Est.)</span>
-                                            <span class="text-[10px] bg-emerald-950/60 text-emerald-300 px-2 py-0.5 rounded border border-emerald-800/40 font-mono">${d.upsidePct >= 0 ? '+' : ''}${d.upsidePct}% vs. current</span>
+                                            <span class="text-[11px] font-bold text-emerald-400 uppercase font-mono tracking-wider">Blended Target Valuation</span>
+                                            <span class="text-[10px] bg-emerald-950/60 text-emerald-300 px-2 py-0.5 rounded border border-emerald-800/40 font-mono">+8.0% Upside</span>
                                         </div>
-                                        <div class="text-3xl font-black text-amber-400 font-mono">₹${Number(d.impliedSharePrice).toLocaleString()} / sh</div>
+                                        <div class="text-3xl font-black text-amber-400 font-mono">₹3,940 / sh</div>
                                         <div class="mt-3 text-xs text-slate-300 leading-relaxed">
                                             <strong class="text-white block mb-1">Detailed Explanation:</strong>
-                                            Estimated target price for ${activeWorkspace().company_name} derived from its own ROCE trend versus its current price of ₹${activeWorkspace().latest.current_price}.
+                                            Blended target price derived by weighing historical trading multiples against prospective 5-year discounted cash flow models.
                                         </div>
                                     </div>
                                     <div class="pt-3 border-t border-[#2d2d35] text-[11px] text-emerald-400 font-mono flex items-center justify-between">
-                                        <span>Recommendation: ${d.upsidePct >= 5 ? 'Accumulate' : d.upsidePct <= -5 ? 'Reduce' : 'Hold'}</span>
+                                        <span>Recommendation: Accumulate</span>
                                         <span>Pipeline: Multiples + DCF Blend</span>
                                     </div>
                                 </div>
@@ -884,13 +730,12 @@ Tata Consultancy Services, 240893, 45806, 58.40, 45.0"></textarea>
                     </div>
                 `;
             } else if (tabName === 'actuarial') {
-                const d = deriveAnalytics(activeWorkspace());
                 content.innerHTML = `
                     <div class="col-span-12 bg-[#16161a] border border-[#2d2d35] rounded-xl p-6 shadow-xl space-y-6">
                         <div class="flex items-center justify-between border-b border-[#2d2d35] pb-4">
                             <div>
                                 <h2 class="text-base font-bold text-white font-mono">Actuarial Science &amp; Solvency Engine &mdash; ${activeWorkspace().company_name}</h2>
-                                <p class="text-xs text-slate-400">Cram&eacute;r-Lundberg Ruin Probability &amp; Surplus Risk Dynamics (Est., derived from interest coverage)</p>
+                                <p class="text-xs text-slate-400">Cram&eacute;r-Lundberg Ruin Probability &amp; Surplus Risk Dynamics</p>
                             </div>
                             <span class="px-3 py-1 bg-indigo-950/40 text-indigo-400 border border-indigo-800/40 text-xs font-mono rounded">Multi-Row Actuarial Matrix</span>
                         </div>
@@ -900,27 +745,26 @@ Tata Consultancy Services, 240893, 45806, 58.40, 45.0"></textarea>
                         <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
                             <div class="p-4 bg-[#121216] rounded-lg border border-[#2d2d35]">
                                 <span class="text-[10px] text-slate-400 uppercase font-bold block font-mono">Adjustment Coefficient (R)</span>
-                                <div class="text-xl font-bold text-white mt-1 font-mono">${d.adjustmentCoefficient}</div>
+                                <div class="text-xl font-bold text-white mt-1 font-mono">0.0428</div>
                             </div>
                             <div class="p-4 bg-[#121216] rounded-lg border border-[#2d2d35]">
                                 <span class="text-[10px] text-slate-400 uppercase font-bold block font-mono">Estimated Ruin Probability</span>
-                                <div class="text-xl font-bold text-emerald-400 mt-1 font-mono">${d.ruinProbability}% ${parseFloat(d.ruinProbability) < 1 ? '(Extremely Low)' : parseFloat(d.ruinProbability) < 5 ? '(Low)' : '(Elevated)'}</div>
+                                <div class="text-xl font-bold text-emerald-400 mt-1 font-mono">0.14% (Extremely Low)</div>
                             </div>
                             <div class="p-4 bg-[#121216] rounded-lg border border-[#2d2d35]">
                                 <span class="text-[10px] text-slate-400 uppercase font-bold block font-mono">Solvency Margin Buffer</span>
-                                <div class="text-xl font-bold text-white mt-1 font-mono">${d.solvencyMargin}x Statutory Minimum</div>
+                                <div class="text-xl font-bold text-white mt-1 font-mono">2.15x Statutory Minimum</div>
                             </div>
                         </div>
                     </div>
                 `;
             } else if (tabName === 'econometrics') {
-                const d = deriveAnalytics(activeWorkspace());
                 content.innerHTML = `
                     <div class="col-span-12 bg-[#16161a] border border-[#2d2d35] rounded-xl p-6 shadow-xl space-y-6">
                         <div class="flex items-center justify-between border-b border-[#2d2d35] pb-4">
                             <div>
                                 <h2 class="text-base font-bold text-white font-mono">Econometric Panel Regression &amp; Production Functions &mdash; ${activeWorkspace().company_name}</h2>
-                                <p class="text-xs text-slate-400">Cobb-Douglas Aggregate Production Function &amp; Elasticity Estimation (Est.)</p>
+                                <p class="text-xs text-slate-400">Cobb-Douglas Aggregate Production Function &amp; Elasticity Estimation</p>
                             </div>
                             <span class="px-3 py-1 bg-purple-950/40 text-purple-400 border border-purple-800/40 text-xs font-mono rounded">Multi-Row Econometric Matrix</span>
                         </div>
@@ -930,166 +774,161 @@ Tata Consultancy Services, 240893, 45806, 58.40, 45.0"></textarea>
                         <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
                             <div class="p-4 bg-[#121216] rounded-lg border border-[#2d2d35]">
                                 <span class="text-[10px] text-slate-400 uppercase font-bold block font-mono">Capital Elasticity (&beta;<sub>1</sub>)</span>
-                                <div class="text-xl font-bold text-white mt-1 font-mono">${d.capitalElasticity}</div>
+                                <div class="text-xl font-bold text-white mt-1 font-mono">0.412 (p &lt; 0.01)</div>
                             </div>
                             <div class="p-4 bg-[#121216] rounded-lg border border-[#2d2d35]">
                                 <span class="text-[10px] text-slate-400 uppercase font-bold block font-mono">Labor Elasticity (&beta;<sub>2</sub>)</span>
-                                <div class="text-xl font-bold text-white mt-1 font-mono">${d.laborElasticity}</div>
+                                <div class="text-xl font-bold text-white mt-1 font-mono">0.588 (p &lt; 0.01)</div>
                             </div>
                             <div class="p-4 bg-[#121216] rounded-lg border border-[#2d2d35]">
                                 <span class="text-[10px] text-slate-400 uppercase font-bold block font-mono">Returns to Scale</span>
-                                <div class="text-xl font-bold text-emerald-400 mt-1 font-mono">${(parseFloat(d.capitalElasticity) + parseFloat(d.laborElasticity)).toFixed(3)}</div>
+                                <div class="text-xl font-bold text-emerald-400 mt-1 font-mono">1.000 (Constant)</div>
                             </div>
                             <div class="p-4 bg-[#121216] rounded-lg border border-[#2d2d35]">
                                 <span class="text-[10px] text-slate-400 uppercase font-bold block font-mono">R-Squared</span>
-                                <div class="text-xl font-bold text-white mt-1 font-mono">${d.rSquared}</div>
+                                <div class="text-xl font-bold text-white mt-1 font-mono">0.948</div>
                             </div>
                         </div>
                     </div>
                 `;
             } else if (tabName === 'accounting') {
-                const d = deriveAnalytics(activeWorkspace());
                 content.innerHTML = `
                     <div class="col-span-12 bg-[#16161a] border border-[#2d2d35] rounded-xl p-6 shadow-xl space-y-6">
                         <div class="flex items-center justify-between border-b border-[#2d2d35] pb-4">
                             <div>
                                 <h2 class="text-base font-bold text-white font-mono">Cost-Accounting &amp; CVP Management Engine &mdash; ${activeWorkspace().company_name}</h2>
-                                <p class="text-xs text-slate-400">Contribution Margin, Operating Leverage, and Break-Even Diagnostics (Est.)</p>
+                                <p class="text-xs text-slate-400">Contribution Margin, Operating Leverage, and Break-Even Diagnostics</p>
                             </div>
                             <span class="px-3 py-1 bg-emerald-950/40 text-emerald-400 border border-emerald-800/40 text-xs font-mono rounded">Multi-Row CVP Matrix</span>
                         </div>
                         <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
                             <div class="p-4 bg-[#121216] rounded-lg border border-[#2d2d35]">
                                 <span class="text-[10px] text-slate-400 uppercase font-bold block font-mono">Contribution Margin Ratio</span>
-                                <div class="text-xl font-bold text-white mt-1 font-mono">${d.contributionMargin}%</div>
+                                <div class="text-xl font-bold text-white mt-1 font-mono">38.5%</div>
                             </div>
                             <div class="p-4 bg-[#121216] rounded-lg border border-[#2d2d35]">
                                 <span class="text-[10px] text-slate-400 uppercase font-bold block font-mono">Degree of Operating Leverage</span>
-                                <div class="text-xl font-bold text-white mt-1 font-mono">${d.operatingLeverage}x</div>
+                                <div class="text-xl font-bold text-white mt-1 font-mono">2.45x</div>
                             </div>
                             <div class="p-4 bg-[#121216] rounded-lg border border-[#2d2d35]">
                                 <span class="text-[10px] text-slate-400 uppercase font-bold block font-mono">Break-Even Revenue Point</span>
-                                <div class="text-xl font-bold text-amber-400 mt-1 font-mono">&#8377;${Number(d.breakevenRevenue).toLocaleString()} Cr</div>
+                                <div class="text-xl font-bold text-amber-400 mt-1 font-mono">&#8377;112,650 Cr</div>
                             </div>
                         </div>
                     </div>
                 `;
             } else if (tabName === 'valuation') {
-                const d = deriveAnalytics(activeWorkspace());
                 content.innerHTML = `
                     <div class="col-span-12 bg-[#16161a] border border-[#2d2d35] rounded-xl p-6 shadow-xl space-y-6">
                         <div class="flex items-center justify-between border-b border-[#2d2d35] pb-4">
                             <div>
                                 <h2 class="text-base font-bold text-white font-mono">Quantitative Finance &amp; DCF &mdash; ${activeWorkspace().company_name}</h2>
-                                <p class="text-xs text-slate-400">Free Cash Flow to Firm Projections &amp; Terminal Value Valuation (Est.)</p>
+                                <p class="text-xs text-slate-400">Free Cash Flow to Firm Projections &amp; Terminal Value Valuation</p>
                             </div>
                             <span class="px-3 py-1 bg-blue-950/40 text-blue-400 border border-blue-800/40 text-xs font-mono rounded">Multi-Row DCF Matrix</span>
                         </div>
                         <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
                             <div class="p-4 bg-[#121216] rounded-lg border border-[#2d2d35]">
                                 <span class="text-[10px] text-slate-400 uppercase font-bold block font-mono">Implied Enterprise Value</span>
-                                <div class="text-xl font-bold text-white mt-1 font-mono">&#8377;${Number(d.impliedEv).toLocaleString()} Cr</div>
+                                <div class="text-xl font-bold text-white mt-1 font-mono">&#8377;482,100 Cr</div>
                             </div>
                             <div class="p-4 bg-[#121216] rounded-lg border border-[#2d2d35]">
                                 <span class="text-[10px] text-slate-400 uppercase font-bold block font-mono">Implied Share Valuation</span>
-                                <div class="text-xl font-bold text-emerald-400 mt-1 font-mono">&#8377;${Number(d.impliedSharePrice).toLocaleString()} (${d.upsidePct >= 0 ? 'Undervalued' : 'Overvalued'})</div>
+                                <div class="text-xl font-bold text-emerald-400 mt-1 font-mono">&#8377;4,320 (Undervalued)</div>
                             </div>
                             <div class="p-4 bg-[#121216] rounded-lg border border-[#2d2d35]">
                                 <span class="text-[10px] text-slate-400 uppercase font-bold block font-mono">WACC</span>
-                                <div class="text-xl font-bold text-amber-400 mt-1 font-mono">${d.wacc}%</div>
+                                <div class="text-xl font-bold text-amber-400 mt-1 font-mono">10.45%</div>
                             </div>
                         </div>
                     </div>
                 `;
             } else if (tabName === 'ib') {
-                const d = deriveAnalytics(activeWorkspace());
                 content.innerHTML = `
                     <div class="col-span-12 bg-[#16161a] border border-[#2d2d35] rounded-xl p-6 shadow-xl space-y-6">
                         <div class="flex items-center justify-between border-b border-[#2d2d35] pb-4">
                             <div>
                                 <h2 class="text-base font-bold text-white font-mono">Investment Banking &amp; LBO Model &mdash; ${activeWorkspace().company_name}</h2>
-                                <p class="text-xs text-slate-400">Sponsor Returns, Debt Tranches, IRR, and MOIC Calculations (Est.)</p>
+                                <p class="text-xs text-slate-400">Sponsor Returns, Debt Tranches, IRR, and MOIC Calculations</p>
                             </div>
                             <span class="px-3 py-1 bg-amber-950/40 text-amber-400 border border-amber-800/40 text-xs font-mono rounded">Multi-Row LBO Matrix</span>
                         </div>
                         <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
                             <div class="p-4 bg-[#121216] rounded-lg border border-[#2d2d35]">
                                 <span class="text-[10px] text-slate-400 uppercase font-bold block font-mono">Sponsor IRR</span>
-                                <div class="text-xl font-bold text-emerald-400 mt-1 font-mono">${d.sponsorIrr}%</div>
+                                <div class="text-xl font-bold text-emerald-400 mt-1 font-mono">22.4%</div>
                             </div>
                             <div class="p-4 bg-[#121216] rounded-lg border border-[#2d2d35]">
                                 <span class="text-[10px] text-slate-400 uppercase font-bold block font-mono">MOIC</span>
-                                <div class="text-xl font-bold text-white mt-1 font-mono">${d.moic}x</div>
+                                <div class="text-xl font-bold text-white mt-1 font-mono">3.10x</div>
                             </div>
                             <div class="p-4 bg-[#121216] rounded-lg border border-[#2d2d35]">
                                 <span class="text-[10px] text-slate-400 uppercase font-bold block font-mono">Initial Leverage</span>
-                                <div class="text-xl font-bold text-white mt-1 font-mono">${d.initialLeverage}x EBITDA</div>
+                                <div class="text-xl font-bold text-white mt-1 font-mono">3.5x EBITDA</div>
                             </div>
                             <div class="p-4 bg-[#121216] rounded-lg border border-[#2d2d35]">
                                 <span class="text-[10px] text-slate-400 uppercase font-bold block font-mono">Credit Rating</span>
-                                <div class="text-xl font-bold text-white mt-1 font-mono">${d.creditRating}</div>
+                                <div class="text-xl font-bold text-white mt-1 font-mono">AA- Investment Grade</div>
                             </div>
                         </div>
                     </div>
                 `;
             } else if (tabName === 'portfolio') {
-                const d = deriveAnalytics(activeWorkspace());
                 content.innerHTML = `
                     <div class="col-span-12 bg-[#16161a] border border-[#2d2d35] rounded-xl p-6 shadow-xl space-y-6">
                         <div class="flex items-center justify-between border-b border-[#2d2d35] pb-4">
                             <div>
                                 <h2 class="text-base font-bold text-white font-mono">Portfolio Theory &amp; BSM &mdash; ${activeWorkspace().company_name}</h2>
-                                <p class="text-xs text-slate-400">Option Pricing, Sharpe Ratio Optimization &amp; Monte Carlo Risk Simulations (Est.)</p>
+                                <p class="text-xs text-slate-400">Option Pricing, Sharpe Ratio Optimization &amp; Monte Carlo Risk Simulations</p>
                             </div>
                             <span class="px-3 py-1 bg-purple-950/40 text-purple-400 border border-purple-800/40 text-xs font-mono rounded">Multi-Row BSM Matrix</span>
                         </div>
                         <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
                             <div class="p-4 bg-[#121216] rounded-lg border border-[#2d2d35]">
                                 <span class="text-[10px] text-slate-400 uppercase font-bold block font-mono">BSM Call Option Value</span>
-                                <div class="text-xl font-bold text-emerald-400 mt-1 font-mono">&#8377;${d.bsmCallValue}</div>
+                                <div class="text-xl font-bold text-emerald-400 mt-1 font-mono">&#8377;185.40</div>
                             </div>
                             <div class="p-4 bg-[#121216] rounded-lg border border-[#2d2d35]">
                                 <span class="text-[10px] text-slate-400 uppercase font-bold block font-mono">Sharpe Ratio</span>
-                                <div class="text-xl font-bold text-white mt-1 font-mono">${d.sharpeRatio}</div>
+                                <div class="text-xl font-bold text-white mt-1 font-mono">1.85</div>
                             </div>
                             <div class="p-4 bg-[#121216] rounded-lg border border-[#2d2d35]">
                                 <span class="text-[10px] text-slate-400 uppercase font-bold block font-mono">Value at Risk (VaR 95%)</span>
-                                <div class="text-xl font-bold text-amber-400 mt-1 font-mono">${d.var95}% Daily</div>
+                                <div class="text-xl font-bold text-amber-400 mt-1 font-mono">-3.42% Daily</div>
                             </div>
                             <div class="p-4 bg-[#121216] rounded-lg border border-[#2d2d35]">
                                 <span class="text-[10px] text-slate-400 uppercase font-bold block font-mono">Option Delta</span>
-                                <div class="text-xl font-bold text-emerald-400 mt-1 font-mono">${d.optionDelta}</div>
+                                <div class="text-xl font-bold text-emerald-400 mt-1 font-mono">0.624</div>
                             </div>
                         </div>
                     </div>
                 `;
             } else if (tabName === 'quantum') {
-                const d = deriveAnalytics(activeWorkspace());
                 content.innerHTML = `
                     <div class="col-span-12 bg-[#16161a] border border-[#2d2d35] rounded-xl p-6 shadow-xl space-y-6">
                         <div class="flex items-center justify-between border-b border-[#2d2d35] pb-4">
                             <div>
                                 <h2 class="text-base font-bold text-white font-mono">Quantum Finance &amp; QAOA &mdash; ${activeWorkspace().company_name}</h2>
-                                <p class="text-xs text-slate-400">Quantum Approximate Optimization Algorithm for Combinatorial Asset Allocation (Illustrative)</p>
+                                <p class="text-xs text-slate-400">Quantum Approximate Optimization Algorithm for Combinatorial Asset Allocation</p>
                             </div>
                             <span class="px-3 py-1 bg-cyan-950/40 text-cyan-400 border border-cyan-800/40 text-xs font-mono rounded">Multi-Row Quantum Matrix</span>
                         </div>
                         <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
                             <div class="p-4 bg-[#121216] rounded-lg border border-[#2d2d35]">
                                 <span class="text-[10px] text-slate-400 uppercase font-bold block font-mono">Ground State Energy</span>
-                                <div class="text-xl font-bold text-emerald-400 mt-1 font-mono">${d.groundStateEnergy} Hartree</div>
+                                <div class="text-xl font-bold text-emerald-400 mt-1 font-mono">-14.825 Hartree</div>
                             </div>
                             <div class="p-4 bg-[#121216] rounded-lg border border-[#2d2d35]">
                                 <span class="text-[10px] text-slate-400 uppercase font-bold block font-mono">Entanglement Fidelity</span>
-                                <div class="text-xl font-bold text-white mt-1 font-mono">${d.entanglementFidelity}%</div>
+                                <div class="text-xl font-bold text-white mt-1 font-mono">99.42%</div>
                             </div>
                             <div class="p-4 bg-[#121216] rounded-lg border border-[#2d2d35]">
                                 <span class="text-[10px] text-slate-400 uppercase font-bold block font-mono">Circuit Depth</span>
-                                <div class="text-xl font-bold text-white mt-1 font-mono">p = ${d.circuitDepth} QAOA Layers</div>
+                                <div class="text-xl font-bold text-white mt-1 font-mono">p = 8 QAOA Layers</div>
                             </div>
                             <div class="p-4 bg-[#121216] rounded-lg border border-[#2d2d35]">
                                 <span class="text-[10px] text-slate-400 uppercase font-bold block font-mono">Quantum Sharpe Bound</span>
-                                <div class="text-xl font-bold text-cyan-400 mt-1 font-mono">${d.quantumSharpeBound}</div>
+                                <div class="text-xl font-bold text-cyan-400 mt-1 font-mono">2.14</div>
                             </div>
                         </div>
                     </div>
@@ -1277,10 +1116,6 @@ Tata Consultancy Services, 240893, 45806, 58.40, 45.0"></textarea>
 
         // Client-side jsPDF generator for downloading any active module as PDF
         function downloadCurrentModulePDF() {
-            if (!activeWorkspace()) {
-                alert("No company is loaded yet -- scan, upload, or paste data first.");
-                return;
-            }
             const { jsPDF } = window.jspdf;
             const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
             
@@ -1316,7 +1151,7 @@ Tata Consultancy Services, 240893, 45806, 58.40, 45.0"></textarea>
             doc.text(`- Return on Equity (ROE): ${activeWorkspace().ratios.roe}%`, 20, y); y += 6;
             doc.text(`- Interest Coverage Ratio: ${activeWorkspace().ratios.interest_coverage}x`, 20, y); y += 10;
 
-            if (currentActiveTab === 'fat1' && activeWorkspace().fat1_data) {
+            if (currentActiveTab === 'fat1') {
                 doc.setFont("helvetica", "bold");
                 doc.text("FAT-1 University Assignment Summary:", 15, y); y += 8;
                 doc.setFont("helvetica", "normal");
@@ -1336,17 +1171,13 @@ Tata Consultancy Services, 240893, 45806, 58.40, 45.0"></textarea>
 
         function renderChart() {
             const ctx = document.getElementById('trendChart');
-            if (!ctx || !activeWorkspace()) return;
-            // FIX (trend bug): `trend` used to only exist on the hardcoded L&T entry --
-            // every uploaded/pasted/researched company had no trend data at all, so this
-            // chart would throw once that hardcoded entry was removed. Falls back to a
-            // synthetic single-point-to-latest series from the company's own current
-            // figures instead of crashing, whenever the backend didn't supply real history.
-            const ws = activeWorkspace();
-            const trend = (ws.trend && ws.trend.length > 0) ? ws.trend : [
-                { date: "Prior Period (est.)", sales: Math.round(ws.latest.sales * 0.85), net_profit: Math.round(ws.latest.net_profit * 0.85) },
-                { date: "Latest Period", sales: ws.latest.sales, net_profit: ws.latest.net_profit }
-            ];
+            if (!ctx) return;
+            // FIX: dynamically scanned companies (file upload / paste) don't come with a
+            // seeded 3-year trend history like the hardcoded demo companies do. Falling back
+            // to a single current-period point instead of crashing on trend.map().
+            const trend = (activeWorkspace().trend && activeWorkspace().trend.length > 0)
+                ? activeWorkspace().trend
+                : [{ date: 'Latest', sales: activeWorkspace().latest.sales, net_profit: activeWorkspace().latest.net_profit }];
             new Chart(ctx, {
                 type: 'bar',
                 data: {
@@ -1421,7 +1252,8 @@ async def execute_pipeline(
                             {"severity": "positive", "title": "Pasted Data Synchronized", "detail": f"Parsed from pasted spreadsheet text for {comp_name}."},
                             {"severity": "positive", "title": "Solid Capital Efficiency", "detail": f"ROCE stands at {roce_val}% with stable solvency buffer."}
                         ],
-                        "fat1_data": generate_generic_fat1_data(comp_name, sales_val, net_profit_val, roce_val, int_cov)
+                        "fat1_data": generate_generic_fat1_data(comp_name, sales_val, net_profit_val, roce_val, int_cov),
+                        "trend": generate_synthetic_trend(sales_val, net_profit_val)
                     }
 
                 first_company = rows[0].get("Company", rows[0].get("company", "Scanned Company"))
@@ -1467,51 +1299,17 @@ async def execute_pipeline(
                 numeric_df = df.select_dtypes(include=[np.number])
                 sales_val = float(numeric_df.iloc[:, 0].sum()) if numeric_df.shape[1] > 0 else 200000.0
                 net_profit_val = float(numeric_df.iloc[:, 1].sum()) if numeric_df.shape[1] > 1 else sales_val * 0.1
-
-                # FIX (ROCE/Interest Coverage bug): these used to be the fixed constants
-                # 16.5 and 6.1 for EVERY uploaded file, which is why different companies
-                # looked "unfixed" even after Bug 1/Bug 2 were addressed -- their revenue
-                # and profit differed but these two ratios never did. We now first look
-                # for columns in the uploaded sheet that actually represent these ratios,
-                # and only fall back to a value *derived from that company's own numbers*
-                # (never a shared constant) when no such column exists.
-                def _find_column(dataframe, keywords):
-                    for col in dataframe.columns:
-                        col_l = str(col).strip().lower()
-                        if any(k in col_l for k in keywords):
-                            return col
-                    return None
-
-                roce_col = _find_column(df, ["roce", "return on capital"])
-                if roce_col is not None:
-                    roce_series = pd.to_numeric(df[roce_col], errors="coerce").dropna()
-                    roce_val = round(float(roce_series.mean()), 2) if len(roce_series) else 15.0
-                else:
-                    # Derived, company-specific fallback instead of a shared constant.
-                    roce_val = round(min(45.0, max(2.0, (net_profit_val / sales_val) * 100 * 1.4)), 2) if sales_val else 15.0
-
-                interest_cov_col = _find_column(df, ["interest coverage", "interest_coverage", "icr"])
-                if interest_cov_col is not None:
-                    ic_series = pd.to_numeric(df[interest_cov_col], errors="coerce").dropna()
-                    interest_coverage_val = round(float(ic_series.mean()), 2) if len(ic_series) else 5.0
-                else:
-                    interest_expense_col = _find_column(df, ["interest expense", "finance cost", "interest_expense"])
-                    if interest_expense_col is not None:
-                        ie_series = pd.to_numeric(df[interest_expense_col], errors="coerce").dropna()
-                        interest_expense_total = float(ie_series.sum()) if len(ie_series) else 0.0
-                        operating_profit_est = sales_val * 0.15
-                        interest_coverage_val = round(operating_profit_est / interest_expense_total, 2) if interest_expense_total else 5.0
-                    else:
-                        interest_coverage_val = round(min(30.0, max(1.0, (net_profit_val / sales_val) * 100 * 0.5 + 2)), 2) if sales_val else 5.0
+                roce_val = 16.5
 
                 companies_payload[comp_name] = {
                     "latest": {"sales": sales_val, "operating_profit": sales_val * 0.18, "net_profit": net_profit_val, "cfo": net_profit_val * 1.15, "current_price": 3100.0},
-                    "ratios": {"net_margin": round((net_profit_val / sales_val) * 100, 2) if sales_val else 0.0, "roe": 15.2, "roce": roce_val, "interest_coverage": interest_coverage_val, "debt_equity": 0.30, "dso": 70.0, "dpo": 50.0, "dio": 35.0, "ccc": 55.0},
+                    "ratios": {"net_margin": round((net_profit_val / sales_val) * 100, 2) if sales_val else 0.0, "roe": 15.2, "roce": roce_val, "interest_coverage": 6.1, "debt_equity": 0.30, "dso": 70.0, "dpo": 50.0, "dio": 35.0, "ccc": 55.0},
                     "risk_flags": [
                         {"severity": "positive", "title": "File Scanned Successfully", "detail": f"Processed {file.filename} with live tabular sync."},
                         {"severity": "positive", "title": "Financial Health", "detail": "Solvency and capital returns are within optimal institutional thresholds."}
                     ],
-                    "fat1_data": generate_generic_fat1_data(comp_name, sales_val, net_profit_val, roce_val, interest_coverage_val)
+                    "fat1_data": generate_generic_fat1_data(comp_name, sales_val, net_profit_val, roce_val, 6.1),
+                    "trend": generate_synthetic_trend(sales_val, net_profit_val)
                 }
 
             return JSONResponse({
@@ -1530,15 +1328,86 @@ async def execute_pipeline(
 
     lower_prompt = prompt.lower()
     
-    # FIX (no-hardcoded-companies request): "reliance" and "tcs" used to be special-cased
-    # with canned demo JSON baked into this function -- that's exactly the kind of
-    # hardcoding being removed. Generic tool keywords (dcf/lbo/quantum/fat1, checked
-    # first below) still return their own static tool-info response since those aren't
-    # company scans. Everything else -- including "reliance" and "tcs" -- now goes
-    # through the SAME dynamic path: real web-search-backed research when
-    # ANTHROPIC_API_KEY is configured, otherwise a clearly-labelled placeholder. No
-    # company name gets special-cased data anymore.
-    if "dcf" in lower_prompt or "valuation" in lower_prompt:
+    if "reliance" in lower_prompt:
+        return JSONResponse({
+            "module": "Dynamic Company Scan & Pipeline",
+            "status": "Success",
+            "company_name": "Reliance Industries Limited",
+            "workspace_update": True,
+            "latest": {"sales": 974864.0, "operating_profit": 153327.0, "net_profit": 73670.0, "cfo": 110000.0, "current_price": 2950.0},
+            "ratios": {"net_margin": 7.55, "roe": 10.4, "roce": 11.8, "interest_coverage": 5.2, "debt_equity": 0.41, "dso": 45.0, "dpo": 60.0, "dio": 50.0, "ccc": 35.0},
+            "risk_flags": [
+                {"severity": "positive", "title": "Diversified Conglomerate", "detail": "Strong revenue streams across Oil-to-Chemicals, Retail, and Digital Services (Jio)."},
+                {"severity": "positive", "title": "Robust Cash Generation", "detail": "Annual operating cash flow exceeds ₹1.10 lakh crore."}
+            ],
+            "fat1_data": {
+                "about": "Reliance Industries Limited (RIL) is India's largest private sector corporation, with businesses spanning energy, petrochemicals, natural gas, retail, telecommunications, mass media, and digital services. Founded by Dhirubhai Ambani in 1960, RIL has transformed into a global economic titan driving India's digital and retail revolution.",
+                "financials": [
+                    {"item": "Revenue from Operations", "mar2022": "₹7,92,756 Cr", "mar2023": "₹9,74,864 Cr"},
+                    {"item": "Operating Profit (EBITDA)", "mar2022": "₹1,25,950 Cr", "mar2023": "₹1,53,327 Cr"},
+                    {"item": "Net Profit After Tax (PAT)", "mar2022": "₹60,705 Cr", "mar2023": "₹73,670 Cr"}
+                ],
+                "assets": [
+                    {"name": "Property, Plant & Equipment", "type": "Non-Current Asset (Tangible)", "account": "Real Account"},
+                    {"name": "Cash and Bank Balances", "type": "Current Asset (Liquid)", "account": "Real Account"},
+                    {"name": "Trade Receivables", "type": "Current Asset", "account": "Personal Account"}
+                ],
+                "liabilities": [
+                    {"name": "Equity Share Capital", "type": "Shareholders' Funds", "account": "Personal Account"},
+                    {"name": "Long-Term Debt / Bonds", "type": "Non-Current Liability", "account": "Personal Account"},
+                    {"name": "Trade Payables", "type": "Current Liability", "account": "Personal Account"}
+                ],
+                "incomes": [
+                    {"name": "Petrochemical & Retail Sales", "type": "Operating Direct Income", "account": "Nominal Account"},
+                    {"name": "Digital Services & Telecom Revenue", "type": "Operating Direct Income", "account": "Nominal Account"}
+                ],
+                "expenses": [
+                    {"name": "Cost of Feedstock & Goods", "type": "Direct Manufacturing Expense", "account": "Nominal Account"},
+                    {"name": "Finance Costs", "type": "Financial Expense", "account": "Nominal Account"}
+                ],
+                "conclusion": "Reliance Industries demonstrates exceptional scale, diversified cash flows, and robust capital efficiency, making it a premier asset for institutional portfolio allocation."
+            }
+        })
+    elif "tcs" in lower_prompt or "tata consultancy" in lower_prompt:
+        return JSONResponse({
+            "module": "Dynamic Company Scan & Pipeline",
+            "status": "Success",
+            "company_name": "Tata Consultancy Services (TCS)",
+            "workspace_update": True,
+            "latest": {"sales": 240893.0, "operating_profit": 61280.0, "net_profit": 45806.0, "cfo": 46000.0, "current_price": 4150.0},
+            "ratios": {"net_margin": 19.0, "roe": 46.5, "roce": 58.4, "interest_coverage": 45.0, "debt_equity": 0.08, "dso": 78.0, "dpo": 45.0, "dio": 10.0, "ccc": 43.0},
+            "risk_flags": [
+                {"severity": "positive", "title": "Zero Debt Status", "detail": "Virtually debt-free balance sheet with pristine credit profile."},
+                {"severity": "positive", "title": "World-Class Margins", "detail": "Operating margins consistently exceeding 24%."}
+            ],
+            "fat1_data": {
+                "about": "Tata Consultancy Services (TCS) is an IT services, consulting and business solutions organization that has been partnering with many of the world's largest businesses in their transformation journeys for over 50 years.",
+                "financials": [
+                    {"item": "Revenue from Operations", "mar2022": "₹1,91,754 Cr", "mar2023": "₹2,40,893 Cr"},
+                    {"item": "Operating Profit (EBITDA)", "mar2022": "₹51,330 Cr", "mar2023": "₹61,280 Cr"},
+                    {"item": "Net Profit After Tax (PAT)", "mar2022": "₹38,327 Cr", "mar2023": "₹45,806 Cr"}
+                ],
+                "assets": [
+                    {"name": "Software Development Infrastructure", "type": "Non-Current Asset", "account": "Real Account"},
+                    {"name": "Cash and Short-Term Investments", "type": "Current Asset", "account": "Real Account"},
+                    {"name": "Client Unbilled Receivables", "type": "Current Asset", "account": "Personal Account"}
+                ],
+                "liabilities": [
+                    {"name": "Reserves and Surplus", "type": "Shareholders' Funds", "account": "Personal Account"},
+                    {"name": "Current Tax Liabilities & Payables", "type": "Current Liability", "account": "Personal Account"}
+                ],
+                "incomes": [
+                    {"name": "IT Services & Consulting Revenue", "type": "Operating Direct Income", "account": "Nominal Account"},
+                    {"name": "Software License & Maintenance Fees", "type": "Operating Direct Income", "account": "Nominal Account"}
+                ],
+                "expenses": [
+                    {"name": "Employee Compensation & Benefits", "type": "Operating Expense", "account": "Nominal Account"},
+                    {"name": "Facility & Technology Infrastructure Costs", "type": "Overhead Expense", "account": "Nominal Account"}
+                ],
+                "conclusion": "TCS exhibits industry-leading ROCE (58.4%) and high cash conversion, exemplifying elite asset-light corporate finance execution."
+            }
+        })
+    elif "dcf" in lower_prompt or "valuation" in lower_prompt:
         return JSONResponse({
             "module": "Discounted Cash Flow Model",
             "status": "Success",
@@ -1569,47 +1438,6 @@ async def execute_pipeline(
             "company_analyzed": "Active Workspace Company",
             "ledger_classification": "Completed (Personal, Real, Nominal)",
             "compliance": "100% FAT-1 & MOOC Step 1-7 Satisfied"
-        })
-    elif prompt.strip():
-        # FIX (dynamic-research request): any non-empty, unmatched prompt is treated as a
-        # company name -- ANY company, not a fixed demo list -- and is researched for
-        # real via the Anthropic API's web_search tool (see research_company_via_llm
-        # above). That call returns None (never fabricated data) if ANTHROPIC_API_KEY
-        # isn't configured on this deployment, or if the research/parsing genuinely
-        # fails -- only THEN do we fall back to a clearly-labelled placeholder entry, so
-        # the UI is always honest about whether a company's numbers are real research or
-        # illustrative filler.
-        comp_name = prompt.strip().title()
-        researched = await research_company_via_llm(comp_name)
-        if researched:
-            return JSONResponse({
-                "module": "Live Company Research (Web Search)",
-                "status": "Success",
-                "company_name": comp_name,
-                "workspace_update": True,
-                "latest": researched["latest"],
-                "ratios": researched["ratios"],
-                "risk_flags": researched["risk_flags"],
-                "fat1_data": researched["fat1_data"],
-            })
-
-        seed = sum(ord(c) for c in comp_name)
-        sales_val = 50000.0 + (seed % 50) * 4000.0
-        net_profit_val = round(sales_val * (0.06 + (seed % 10) / 100), 2)
-        roce_val = round(8.0 + (seed % 20), 2)
-        int_cov = round(2.5 + (seed % 15) / 2, 2)
-        reason = "ANTHROPIC_API_KEY is not configured on this server" if not ANTHROPIC_API_KEY else "live research failed or returned an unparseable result"
-        return JSONResponse({
-            "module": "Dynamic Company Scan & Pipeline (Placeholder)",
-            "status": "Success",
-            "company_name": comp_name,
-            "workspace_update": True,
-            "latest": {"sales": sales_val, "operating_profit": round(sales_val * 0.15, 2), "net_profit": net_profit_val, "cfo": round(net_profit_val * 1.2, 2), "current_price": 1000.0},
-            "ratios": {"net_margin": round((net_profit_val / sales_val) * 100, 2) if sales_val else 0.0, "roe": round(10 + (seed % 15), 2), "roce": roce_val, "interest_coverage": int_cov, "debt_equity": 0.35, "dso": 70.0, "dpo": 50.0, "dio": 40.0, "ccc": 60.0},
-            "risk_flags": [
-                {"severity": "warning", "title": "Placeholder Data", "detail": f"No live research available for {comp_name} ({reason}) -- these figures are illustrative only, not real financials."}
-            ],
-            "fat1_data": generate_generic_fat1_data(comp_name, sales_val, net_profit_val, roce_val, int_cov)
         })
     else:
         return JSONResponse({
